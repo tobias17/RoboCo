@@ -1,12 +1,9 @@
-from inputs import *
-from controllables import *
-from sensors import *
-from scriptruntime import *
-from ports import *
-from color import *
-from routines import *
-from math import tau
-from time import sleep
+from inputs import Input
+from controllables import DCMotor
+from sensors import InertialMotionUnit
+from routines import Vector3, Matrix4x4
+from time import time_ns
+import math
 
 # Boiler plate to interface with a gamepad through windows
 from ctypes import WinDLL, WinError, Structure, POINTER, byref, c_ubyte
@@ -39,11 +36,7 @@ class XINPUT_STATE(Structure):
     def __repr__(self):
         return f"XINPUT_STATE(dwPacketNumber={self.dwPacketNumber}, Gamepad={self.Gamepad})"
 class XInput:
-    """Minimal XInput API wrapper"""
     def __init__(self):
-        # https://docs.microsoft.com/en-us/windows/win32/xinput/xinput-versions
-        # XInput 1.4 is available only on Windows 8+.
-        # Older Windows versions are End Of Life anyway.
         lib_name = "XInput1_4.dll"  
         lib_path = find_library(lib_name)
         if not lib_path:
@@ -110,6 +103,31 @@ class Gamepad:
         }
         return action_map[key](self.xi.GetState(self.gamepad_index)[1])
 
+def get_time():
+    return time_ns() / (10 ** 9)
+
+# Class for calculating the PID control (used for module rotation)
+class PID:
+    previous_error, integral = 0, 0
+
+    def __init__(self, Kp, Ki, Kd):
+        self.Kp = Kp
+        self.Ki = Ki
+        self.Kd = Kd
+        self.prev_time = get_time()
+    
+    def get_power(self, error):
+        curr_time = get_time()
+        dt = curr_time - self.prev_time
+
+        self.integral = self.integral + error * dt
+        derivative = (error - self.previous_error) / dt
+        output = self.Kp * error + self.Ki * self.integral + self.Kd * derivative
+
+        self.previous_error = error
+        self.prev_time = curr_time
+        return output
+
 # Class for holding information about module placement and connection on the robot
 class SwerveModule:
     def __init__(self, x, y, drive_pin, rot_pin, imu_pin):
@@ -130,6 +148,7 @@ class SwerveController:
         self.gamepad = Gamepad()
         self.target_vels = [0 for _ in range(self.module_count)]
         self.target_rots = [0 for _ in range(self.module_count)]
+        self.pids = [PID(Kp=1, Ki=0.02, Kd=0.02) for _ in range(self.module_count)]
 
     def step(self):
         self.mode_controls()
@@ -140,7 +159,7 @@ class SwerveController:
         if self.curr_mode == 0:
             self.direct_drive(drive, strafe, turn)
         elif self.curr_mode == 1:
-            pass
+            self.gps_drive(drive, strafe, turn)
         else:
             print(f'Robot currently in unsupported mode! Reverting back to mode 0 ({self.mode_names[0]})!')
             self.curr_mode = 0
@@ -148,7 +167,7 @@ class SwerveController:
 
     prev_mode_mod = False
     curr_mode, mode_count = 0, 1
-    mode_names = ['Direct Drive', 'GPS Drive']
+    mode_names = ['Direct Drive']
     def mode_controls(self):
         swap_modes = Input.pressed(self.keyboard_controls['swap_modes']) or self.gamepad.get_button(self.gamepad_controls['swap_modes'])
         if not self.prev_mode_mod and swap_modes:
@@ -259,16 +278,17 @@ class SwerveController:
         raw_rots = [SwerveController.get_heading(self.modules[i].imu_pin) for i in module_range]
         robot_heading = SwerveController.get_heading(self.imu_pin)
         rots = [robot_heading - raw_rots[i] for i in module_range]
-        diffs = [-SwerveController.angle_between(rots[i], self.target_rots[i]) / 180. for i in module_range]
+        diffs = [max(-1, min(1, -SwerveController.angle_between(rots[i], self.target_rots[i]) / 180. * 2)) for i in module_range]
+        delta_rot = [self.pids[i].get_power(diffs[i]) for i in module_range]
         
-        drive_motors = [controllables.DCMotor(self.modules[i].drive_pin) for i in module_range]
-        rot_motors   = [controllables.DCMotor(self.modules[i].rot_pin) for i in module_range]
+        drive_motors = [DCMotor(self.modules[i].drive_pin) for i in module_range]
+        rot_motors   = [DCMotor(self.modules[i].rot_pin) for i in module_range]
         for i in module_range:
             target_vel = self.target_vels[i] * self.curr_pow
             drive_motors[i].flipped = target_vel < 0
             drive_motors[i].spin(abs(target_vel))
-            rot_motors[i].flipped = diffs[i] < 0
-            rot_motors[i].spin(abs(diffs[i]))
+            rot_motors[i].flipped = delta_rot[i] < 0
+            rot_motors[i].spin(abs(delta_rot[i]))
 
     def get_heading(pin, axis=lambda v: v.y):
         return axis(Vector3(Matrix4x4.from_rotation(InertialMotionUnit(pin).rotation_axis())._backing.rotation.eulerAngles))
