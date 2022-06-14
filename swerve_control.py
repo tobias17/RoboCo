@@ -1,8 +1,10 @@
+from modulefinder import Module
+from re import L
 from inputs import Input
 from controllables import DCMotor
 from sensors import InertialMotionUnit
 from routines import Vector3, Matrix4x4
-from time import time_ns
+from time import time_ns, sleep
 import math
 
 # Boiler plate to interface with a gamepad through windows
@@ -110,10 +112,11 @@ def get_time():
 class PID:
     previous_error, integral = 0, 0
 
-    def __init__(self, Kp, Ki, Kd):
+    def __init__(self, Kp, Ki, Kd, dead_zone=0):
         self.Kp = Kp
         self.Ki = Ki
         self.Kd = Kd
+        self.dead_zone = dead_zone
         self.prev_time = get_time()
     
     def get_power(self, error):
@@ -126,20 +129,44 @@ class PID:
 
         self.previous_error = error
         self.prev_time = curr_time
+
+        if abs(error) < self.dead_zone:
+            return 0
         return output
+
+class Helpers:
+    def get_heading(pin, axis=lambda v: v.y):
+        return axis(Vector3(Matrix4x4.from_rotation(InertialMotionUnit(pin).rotation_axis())._backing.rotation.eulerAngles))
+
+    def angle_between(angle1, angle2):
+        diff = angle1 - angle2
+        while diff > 180:
+            diff -= 360
+        while diff < -180:
+            diff += 360
+        return diff
+
+class ModuleDriver:
+    def __init__(self, pin, reversed=False, counter_rotate=False):
+        self.pin = pin
+        self.reversed = reversed
+        self.counter_rotate = counter_rotate
 
 # Class for holding information about module placement and connection on the robot
 class SwerveModule:
-    def __init__(self, x, y, drive_pin, rot_pin, imu_pin):
+    def __init__(self, x, y, drivers, rot_pin, imu_pin, imu_read=lambda v: v.y):
         self.x = x
         self.y = y
-        self.drive_pin = drive_pin
+        self.drivers = drivers
+        if isinstance(self.drivers, ModuleDriver):
+            self.drivers = [self.drivers]
         self.rot_pin = rot_pin
         self.imu_pin = imu_pin
+        self.imu_read = imu_read
 
 # Main class that handles all logic from processing user input to applying motor speed
 class SwerveController:
-    def __init__(self, imu_pin, modules, keyboard_controls, gamepad_controls):
+    def __init__(self, imu_pin, modules, keyboard_controls, gamepad_controls, pid_setup={'Kp': 1, 'Ki': 0, 'Kd': 0, 'dead_zone': 0.02}):
         self.imu_pin = imu_pin
         self.modules = modules
         self.module_count = len(modules)
@@ -148,7 +175,7 @@ class SwerveController:
         self.gamepad = Gamepad()
         self.target_vels = [0 for _ in range(self.module_count)]
         self.target_rots = [0 for _ in range(self.module_count)]
-        self.pids = [PID(Kp=1, Ki=0.02, Kd=0.02) for _ in range(self.module_count)]
+        self.pids = [PID(Kp=pid_setup['Kp'], Ki=pid_setup['Ki'], Kd=pid_setup['Kd'], dead_zone=pid_setup['dead_zone']) for _ in range(self.module_count)]
 
     def step(self):
         self.mode_controls()
@@ -273,45 +300,55 @@ class SwerveController:
             else:
                 self.target_rots[i] = new_rots[i]
 
+    TURN_PROP = 1.0
     def apply_targets(self):
         module_range = range(self.module_count)
-        raw_rots = [SwerveController.get_heading(self.modules[i].imu_pin) for i in module_range]
-        robot_heading = SwerveController.get_heading(self.imu_pin)
+        raw_rots = [Helpers.get_heading(self.modules[i].imu_pin, axis=self.modules[i].imu_read) for i in module_range]
+        robot_heading = Helpers.get_heading(self.imu_pin)
         rots = [robot_heading - raw_rots[i] for i in module_range]
-        diffs = [max(-1, min(1, -SwerveController.angle_between(rots[i], self.target_rots[i]) / 180. * 2)) for i in module_range]
+        diffs = [max(-1, min(1, -Helpers.angle_between(rots[i], self.target_rots[i]) / 180. * 2)) for i in module_range]
         delta_rot = [self.pids[i].get_power(diffs[i]) for i in module_range]
         
-        drive_motors = [DCMotor(self.modules[i].drive_pin) for i in module_range]
-        rot_motors   = [DCMotor(self.modules[i].rot_pin) for i in module_range]
         for i in module_range:
+            drivers = self.modules[i].drivers
+            rot_motor = DCMotor(self.modules[i].rot_pin)
+
             target_vel = self.target_vels[i] * self.curr_pow
-            drive_motors[i].flipped = target_vel < 0
-            drive_motors[i].spin(abs(target_vel))
-            rot_motors[i].flipped = delta_rot[i] < 0
-            rot_motors[i].spin(abs(delta_rot[i]))
+            for driver in drivers:
+                target_vel_2 = target_vel
+                if driver.counter_rotate:
+                    target_vel_2 += delta_rot[i] * (-1 if driver.reversed else 1) * self.TURN_PROP
+                DCMotor(driver.pin).flipped = (target_vel_2 < 0) != (driver.reversed)
+                DCMotor(driver.pin).spin(abs(target_vel_2))
 
-    def get_heading(pin, axis=lambda v: v.y):
-        return axis(Vector3(Matrix4x4.from_rotation(InertialMotionUnit(pin).rotation_axis())._backing.rotation.eulerAngles))
-
-    def angle_between(angle1, angle2):
-        diff = angle1 - angle2
-        while diff > 180:
-            diff -= 360
-        while diff < -180:
-            diff += 360
-        return diff
+            rot_motor.flipped = delta_rot[i] < 0
+            rot_motor.spin(abs(delta_rot[i]))
 
 if __name__ == "__main__":
     swerve_controller = SwerveController(
+
         imu_pin=12,
         modules=[
-            SwerveModule(x=-12, y=-4, drive_pin=0,  rot_pin=4,  imu_pin=8),  # BL
-            SwerveModule(x=12,  y=-4, drive_pin=1,  rot_pin=5,  imu_pin=9),  # BR
-            SwerveModule(x=-12, y=4,  drive_pin=2,  rot_pin=6,  imu_pin=10), # FL
-            SwerveModule(x=12,  y=4,  drive_pin=3,  rot_pin=7,  imu_pin=11), # FR
-            SwerveModule(x=0,   y=-7, drive_pin=13, rot_pin=14, imu_pin=15), # BC
-            SwerveModule(x=0,   y=7,  drive_pin=16, rot_pin=17, imu_pin=18), # FC
+            SwerveModule(x=-12, y=-4, drivers=ModuleDriver(pin=0),  rot_pin=4,  imu_pin=8),  # BL
+            SwerveModule(x=12,  y=-4, drivers=ModuleDriver(pin=1),  rot_pin=5,  imu_pin=9),  # BR
+            SwerveModule(x=-12, y=4,  drivers=ModuleDriver(pin=2),  rot_pin=6,  imu_pin=10), # FL
+            SwerveModule(x=12,  y=4,  drivers=ModuleDriver(pin=3),  rot_pin=7,  imu_pin=11), # FR
+            SwerveModule(x=0,   y=-7, drivers=ModuleDriver(pin=13), rot_pin=14, imu_pin=15), # BC
+            SwerveModule(x=0,   y=7,  drivers=ModuleDriver(pin=16), rot_pin=17, imu_pin=18), # FC
         ],
+        pid_setup={'Kp': 1, 'Ki': 0, 'Kd': 0, 'dead_zone': 0.01},
+
+        # imu_pin=24,
+        # modules=[
+        #     SwerveModule(x=-12, y=4,  drivers=[ModuleDriver(0,  True, True), ModuleDriver(1,  False, True)], rot_pin=2,  imu_pin=3,  imu_read=lambda v: -v.y), # FL
+        #     SwerveModule(x=0,   y=7,  drivers=[ModuleDriver(4,  True, True), ModuleDriver(5,  False, True)], rot_pin=6,  imu_pin=7,  imu_read=lambda v: -v.y), # FC
+        #     SwerveModule(x=12,  y=4,  drivers=[ModuleDriver(8,  True, True), ModuleDriver(9,  False, True)], rot_pin=10, imu_pin=11, imu_read=lambda v: -v.y), # FR
+        #     SwerveModule(x=-12, y=-4, drivers=[ModuleDriver(12, True, True), ModuleDriver(13, False, True)], rot_pin=14, imu_pin=15, imu_read=lambda v: -v.y), # BL
+        #     SwerveModule(x=0,   y=-7, drivers=[ModuleDriver(16, True, True), ModuleDriver(17, False, True)], rot_pin=18, imu_pin=19, imu_read=lambda v: -v.y), # BC
+        #     SwerveModule(x=12,  y=-4, drivers=[ModuleDriver(20, True, True), ModuleDriver(21, False, True)], rot_pin=22, imu_pin=23, imu_read=lambda v: -v.y), # BR
+        # ],
+        # pid_setup={'Kp': 1, 'Ki': 0, 'Kd': 0, 'dead_zone': 0.01},
+
         keyboard_controls={
             "drive_forward": "w",
             "drive_back":    "s",
