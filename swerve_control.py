@@ -1,10 +1,8 @@
-from modulefinder import Module
-from re import L
 from inputs import Input
 from controllables import DCMotor
 from sensors import InertialMotionUnit
 from routines import Vector3, Matrix4x4
-from time import time_ns, sleep
+from time import time_ns
 import math
 
 # Boiler plate to interface with a gamepad through windows
@@ -146,6 +144,7 @@ class Helpers:
             diff += 360
         return diff
 
+# Class for holding information on how the drive motor(s) are configured
 class ModuleDriver:
     def __init__(self, pin, reversed=False, counter_rotate=False):
         self.pin = pin
